@@ -17,9 +17,15 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "threads/malloc.h"
+#include "userprog/syscall.h"
+#include "filesys/file.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+void argument_stack(char **parse, int count, void **esp);
+int count_token(const char* str);
+void remove_child_thread(struct thread *child);
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -35,14 +41,18 @@ process_execute (const char *file_name)
   char *order;
   //ptr that saves leftover arguments
   char *save_ptr;
+  bool no_args;
 
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page (0);
   if (fn_copy == NULL)
     return TID_ERROR;
-  strlcpy (fn_copy, file_name, PGSIZE);
+  strlcpy (fn_copy, file_name, strlen(file_name)+1);
+  no_args = count_token(fn_copy) == 1;
   order = strtok_r(fn_copy," ",&save_ptr);
+  if(no_args)
+  	save_ptr = NULL;
   /* Create a new thread to execute FILE_NAME. */
   tid = thread_create (order, PRI_DEFAULT, start_process, save_ptr);
   if (tid == TID_ERROR)
@@ -52,15 +62,53 @@ process_execute (const char *file_name)
 
 void argument_stack(char **parse, int count, void **esp)
 {
-  
+	char **argv_ptrs;
+	int i, j;
 
+	argv_ptrs = (char**)malloc(sizeof(char*)*(count+1));
+	argv_ptrs[count] = 0;
+	//push argument n~1 into stack
+	for(i=count-1;i>-1;i--)
+	{
+		for(j=strlen(parse[i]);j>-1;j--)
+		{
+			*esp -= 1;
+			**(char**)esp = parse[i][j];
+		}
+		argv_ptrs[i] = *esp; // storing address
+	}
+	//word-alogn
+	while(*(int*)esp%4 != 0)
+	{
+		*esp -= 1;
+		**(char**)esp = 0;
+	}
+	//push argv pointers
+	for(i=count;i>-1;i--)
+	{
+		*esp -= 4;
+		**(long**)esp = (long)argv_ptrs[i];
+	}
+	//push argv, argc
+	*esp -= 4;
+	**(long**)esp = (long)(*esp+4);
+	*esp -= 4;
+	**(int**)esp = count;
+	//fake return address
+	*esp -= 4;
+	**(long**)esp = 0;
+
+	free(argv_ptrs);
 }
 
 int count_token(const char* str) // counting number of tokens before the allocation
 {
   int i;
   int count = 0;
-  for(i=0;i<strlen(str)+1;i++)
+  if(str == NULL)
+  	return 0;
+
+  for(i=0;i<(int)strlen(str)+1;i++)
   {
     if(str[i] == ' ')
     {
@@ -68,7 +116,6 @@ int count_token(const char* str) // counting number of tokens before the allocat
         count++;
     }
   }
-  //printf("%d\n",count+1);
   return count+1;
 }
 
@@ -86,15 +133,24 @@ start_process (void *file_name_)
   char *token; //divided string
   int tokens; //number of tokens
   char **parse; //parsed arguments
-  int i=0; //count for 'for' statements
-  tokens = count_token(file_name_);
+  int i=1; //count for 'for' statements
+  tokens = count_token(file_name_)+1;
   parse = (char**)malloc(tokens*sizeof(char*));
 
-  for(token = strtok_r(file_name_," ",&save_ptr); token !=NULL; token = strtok_r(NULL," ",&save_ptr))
+/*allocate parse array and copy token to the parse array*/
+  parse[0] = (char*)malloc((strlen(thread_current()->name)+1)*sizeof(char));
+  strlcpy(parse[0],thread_current()->name,strlen(thread_current()->name)+1);
+
+  if(file_name_ != NULL)
   {
-    parse[i] = (char*)malloc((strlen(token)+1)*sizeof(char));
-    strlcpy(parse[i],token,strlen(token));
-    i++;
+  	for(token = strtok_r(file_name_," ",&save_ptr);
+			token !=NULL;
+			token = strtok_r(NULL," ",&save_ptr))
+ 	{
+		parse[i] = (char*)malloc((strlen(token)+1)*sizeof(char));
+		strlcpy(parse[i],token,strlen(token)+1);
+		i++;
+ 	}
   }
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
@@ -102,16 +158,17 @@ start_process (void *file_name_)
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
   success = load (parse[0], &if_.eip, &if_.esp);
+  thread_current()->is_loaded = success;
+  sema_up(&thread_current()->load_sema);
 
   /* If load failed, quit. */
-  palloc_free_page (file_name);
+  palloc_free_page (pg_round_down(file_name));
   if (!success) 
     thread_exit ();
   argument_stack(parse,tokens,&if_.esp);
   for(i=0;i<tokens;i++)
     free(parse[i]);
   free(parse);
-  hex_dump(if_.esp,if_.esp,PHYS_BASE - if_.esp, true);
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
      threads/intr-stubs.S).  Because intr_exit takes all of its
@@ -134,7 +191,40 @@ start_process (void *file_name_)
 int
 process_wait (tid_t child_tid UNUSED) 
 {
-  return -1;
+	struct thread *child = get_child_thread(child_tid);
+	int exit_status;
+
+	if(child == NULL)
+		return -1;
+	sema_down(&child->exit_sema);
+	exit_status = child->exit_status;
+	remove_child_thread(child);
+
+	return exit_status;
+}
+
+struct thread *get_child_thread(tid_t child_tid)
+{
+	struct thread *t;
+	struct list_elem *e;
+
+	for(e=list_begin(&thread_current()->child_list);
+		e!=list_end(&thread_current()->child_list);
+		e=list_next(e))
+	{
+		t = list_entry(e,struct thread,child_elem);
+		if(t->tid == child_tid)
+			return t;
+	}
+	return NULL;
+}
+
+void remove_child_thread(struct thread *child)
+{
+	if(get_child_thread(child->tid) == NULL)
+		return;
+	list_remove(&child->child_elem);
+	palloc_free_page(child);
 }
 
 /* Free the current process's resources. */
@@ -144,6 +234,13 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
+  int i;
+  for(i=2;i<cur->num_fd;i++)
+  {
+  	file_close(cur->fd_table[i]);
+  }
+  palloc_free_page(cur->fd_table);
+  
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
@@ -160,6 +257,31 @@ process_exit (void)
       pagedir_activate (NULL);
       pagedir_destroy (pd);
     }
+}
+
+int process_add_file(struct file *f)
+{
+	thread_current()->fd_table[thread_current()->num_fd++] = f;
+	return thread_current()->num_fd-1;
+}
+
+struct file *process_get_file(int fd)
+{
+	if(fd<0 || fd>=thread_current()->num_fd)
+		return NULL;
+	return thread_current()->fd_table[fd];
+}
+
+void process_close_file(int fd)
+{
+	if(fd<thread_current()->num_fd && fd>1)
+	{
+		if(thread_current()->fd_table[fd] != NULL)
+		{
+			file_close(thread_current()->fd_table[fd]);
+			thread_current()->fd_table[fd] = NULL;
+		}
+	}
 }
 
 /* Sets up the CPU for running user code in the current

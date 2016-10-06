@@ -184,6 +184,14 @@ thread_create (const char *name, int priority,
   init_thread (t, name, priority);
   tid = t->tid = allocate_tid ();
 
+  t->is_loaded = t->is_exited = false;
+  t->exit_status = -1;
+  //put t into parent's child list
+  t->parent = thread_current();
+  list_push_back(&t->parent->child_list,&t->child_elem);
+  t->fd_table = palloc_get_page(0);
+  t->num_fd = 2;
+
   /* Prepare thread for first run by initializing its stack.
      Do this atomically so intermediate values for the 'stack' 
      member cannot be observed. */
@@ -298,6 +306,10 @@ thread_exit (void)
      and schedule another process.  That process will destroy us
      when it calls thread_schedule_tail(). */
   intr_disable ();
+
+  thread_current()->is_exited = true;
+  sema_up(&thread_current()->exit_sema);
+
   list_remove (&thread_current()->allelem);
   thread_current ()->status = THREAD_DYING;
   schedule ();
@@ -470,6 +482,10 @@ init_thread (struct thread *t, const char *name, int priority)
   t->priority = priority;
   t->magic = THREAD_MAGIC;
   list_push_back (&all_list, &t->allelem);
+  
+  list_init(&t->child_list);
+  sema_init(&t->load_sema,0);
+  sema_init(&t->exit_sema,0);
 }
 
 /* Allocates a SIZE-byte frame at the top of thread T's stack and
@@ -541,7 +557,7 @@ thread_schedule_tail (struct thread *prev)
   if (prev != NULL && prev->status == THREAD_DYING && prev != initial_thread) 
     {
       ASSERT (prev != cur);
-      palloc_free_page (prev);
+      //palloc_free_page (prev);
     }
 }
 
