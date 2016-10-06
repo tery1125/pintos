@@ -135,9 +135,16 @@ void exit(int status)
 
 bool create(const char *file, unsigned size)
 {
+	bool ret;
+	
 	if(file == NULL)
 		exit(-1);
-	return filesys_create(file,size);
+	
+	lock_acquire(&filesys_lock);
+	ret = filesys_create(file,size);
+	lock_release(&filesys_lock);
+
+	return ret;
 }
 
 bool remove(const char *file)

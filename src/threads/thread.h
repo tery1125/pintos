@@ -109,6 +109,8 @@ struct thread
 	bool is_exited;
 	int exit_status;
 
+	struct file *run_file;
+
 	struct file **fd_table;
 	int num_fd;
 
